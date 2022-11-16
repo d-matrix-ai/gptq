@@ -15,6 +15,7 @@ class INTQuantizer(nn.Module):
         self.register_buffer("maxq", torch.tensor(0))
         self.register_buffer("scale", torch.zeros(shape))
         self.register_buffer("zero", torch.zeros(shape))
+        self.block_size = 1
 
     def configure(
         self,
@@ -80,7 +81,7 @@ class INTQuantizer(nn.Module):
                 xmax1 = p * xmax
                 scale1 = (xmax1 - xmin1) / self.maxq
                 zero1 = torch.round(-xmin1 / scale1) if not self.sym else self.zero
-                q = quantize(x, scale1.unsqueeze(1), zero1.unsqueeze(1), self.maxq)
+                q = _quantize(x, scale1.unsqueeze(1), zero1.unsqueeze(1), self.maxq)
                 q -= x
                 q.abs_()
                 q.pow_(self.norm)
@@ -126,16 +127,21 @@ class INTQuantizer(nn.Module):
 
 
 class DMXQuantizer(nn.Module):
-    def __init__(self, shape=1, fmt="bfp", sebias=7, *args, **kwargs) -> None:
+    def __init__(
+        self, shape=1, fmt="bfp", block_size=128, sebias=7, *args, **kwargs
+    ) -> None:
         super().__init__()
         self.fmt = fmt
+        self.block_size = block_size
         self.sebias = sebias
 
     def configure(self, bits, *args, **kwargs):
-        if self.fmt == "bfp" and bits == 4:
-            self.format = corsair.format.BFP12_128_LD
-        elif self.fmt == "bfp" and bits == 8:
-            self.format = corsair.format.BFP16_64_LD
+        if self.fmt == "bfp":
+            self.format = numerical.BlockFloatingPoint(
+                precision=bits,
+                block_size=self.block_size,
+                block_dim=-1,
+            )
         elif self.fmt == "sbfp" and bits == 4:
             self.format = numerical.ScaledBlockFloatingPoint(
                 block_format=numerical.Format.from_shorthand("XP[4,0](CSN)"),
@@ -144,13 +150,16 @@ class DMXQuantizer(nn.Module):
                     exponent=4,
                     bias=self.sebias,
                     flush_subnormal=True,
+                    unsigned=True,
                     rounding="nearest",
                 ),
                 block_size=16,
                 block_dim=-1,
             )
         else:
-            raise ValueError(f"unsupported precision {bits} for d-Matrix numerical format {self.fmt}")
+            raise ValueError(
+                f"unsupported precision {bits} for d-Matrix numerical format {self.fmt}"
+            )
         self.cast_to = corsair.CastTo(format=self.format)
 
     def find_params(self, *args, **kwargs):
@@ -161,11 +170,11 @@ class DMXQuantizer(nn.Module):
 
     def quantize(self, x):
         if self.ready:
-            if x.shape[-1] == 1:
-                # NOTE: ugly fix due to GPTQ's unsqueeze() before quantize() call
-                return self.cast_to(x.squeeze(-1).float()).unsqueeze(-1)
-            else:
-                return self.cast_to(x.float())
+            # if x.shape[-1] == 1:
+            #     # NOTE: ugly fix due to GPTQ's unsqueeze() before quantize() call
+            #     return self.cast_to(x.squeeze(-1).float()).unsqueeze(-1)
+            # else:
+            return self.cast_to(x.float())
         return x
 
     def enabled(self):

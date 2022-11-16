@@ -5,7 +5,9 @@ import torch
 import torch.nn as nn
 import transformers
 
-from quant import *
+from mltools import corsair
+
+from .quant import *
 
 
 DEBUG = False
@@ -29,6 +31,14 @@ class GPTQ:
         self.nsamples = 0
 
     def add_batch(self, inp, out):
+        if isinstance(
+            self.layer,
+            (
+                corsair.nn.Linear,
+                corsair.nn.Conv2d,
+            ),
+        ):
+            inp = self.layer.input_cast(inp)
         if DEBUG:
             self.inp1 = inp
             self.out1 = out
@@ -59,6 +69,10 @@ class GPTQ:
         self.H += inp.matmul(inp.t())
 
     def fasterquant(self, blocksize=128, percdamp=0.01, groupsize=-1):
+        # TODO: make sure weight dim is correct for quantizer
+        if isinstance(self.quantizer, DMXQuantizer):
+            assert blocksize % self.quantizer.block_size == 0
+
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
@@ -98,25 +112,26 @@ class GPTQ:
             Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
 
-            for i in range(count):
-                w = W1[:, i]
-                d = Hinv1[i, i]
+            if isinstance(self.quantizer, DMXQuantizer):
+                Q1 = self.quantizer.quantize(W1)
+                Err1 = (W1 - Q1).matmul(torch.linalg.inv(Hinv1))
+            else:
+                for i in range(count):
+                    w = W1[:, i]
+                    d = Hinv1[i, i]
 
-                if groupsize != -1:
-                    if (i1 + i) % groupsize == 0:
-                        self.quantizer.find_params(
-                            W[:, (i1 + i) : (i1 + i + groupsize)], weight=True
-                        )
-                # q = quantize(
-                #     w.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
-                # ).flatten()
-                q = self.quantizer.quantize(w.unsqueeze(1)).flatten()  # TODO: verify refactor
-                Q1[:, i] = q
-                Losses1[:, i] = (w - q) ** 2 / d**2
+                    if groupsize != -1:
+                        if (i1 + i) % groupsize == 0:
+                            self.quantizer.find_params(
+                                W[:, (i1 + i) : (i1 + i + groupsize)], weight=True
+                            )
+                    q = self.quantizer.quantize(w.unsqueeze(1)).flatten()
+                    Q1[:, i] = q
 
-                err1 = (w - q) / d
-                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                Err1[:, i] = err1
+                    Losses1[:, i] = (w - q) ** 2 / d**2
+                    err1 = (w - q) / d
+                    W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                    Err1[:, i] = err1
 
             Q[:, i1:i2] = Q1
             Losses[:, i1:i2] = Losses1 / 2
@@ -130,8 +145,9 @@ class GPTQ:
                 print(torch.sum(Losses))
 
         torch.cuda.synchronize()
-        print("time %.2f" % (time.time() - tick))
-        print("error", torch.sum(Losses).item())
+        if DEBUG:
+            print("time %.2f" % (time.time() - tick))
+            print("error", torch.sum(Losses).item())
 
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
