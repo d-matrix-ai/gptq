@@ -5,17 +5,18 @@ import torch
 import torch.nn as nn
 import transformers
 
-from quant import *
+from mltools import corsair
+
+from .quant import *
 
 
-DEBUG = False 
+DEBUG = False
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 
 class GPTQ:
-
     def __init__(self, layer):
         self.layer = layer
         self.dev = self.layer.weight.device
@@ -30,13 +31,23 @@ class GPTQ:
         self.nsamples = 0
 
     def add_batch(self, inp, out):
+        if isinstance(
+            self.layer,
+            (
+                corsair.nn.Linear,
+                corsair.nn.Conv2d,
+            ),
+        ):
+            inp = self.layer.input_cast(inp)
         if DEBUG:
             self.inp1 = inp
             self.out1 = out
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
-        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
+        if isinstance(self.layer, nn.Linear) or isinstance(
+            self.layer, transformers.Conv1D
+        ):
             if len(inp.shape) == 3:
                 inp = inp.reshape((-1, inp.shape[-1]))
             inp = inp.t()
@@ -45,7 +56,7 @@ class GPTQ:
                 self.layer.kernel_size,
                 dilation=self.layer.dilation,
                 padding=self.layer.padding,
-                stride=self.layer.stride
+                stride=self.layer.stride,
             )
             inp = unfold(inp)
             inp = inp.permute([1, 0, 2])
@@ -57,9 +68,11 @@ class GPTQ:
         # self.H += 2 / self.nsamples * inp.matmul(inp.t())
         self.H += inp.matmul(inp.t())
 
-    def fasterquant(
-        self, blocksize=128, percdamp=.01, groupsize=-1
-    ):
+    def fasterquant(self, blocksize=128, percdamp=0.01, groupsize=-1):
+        # TODO: make sure weight dim is correct for quantizer
+        if isinstance(self.quantizer, DMXQuantizer):
+            assert blocksize % self.quantizer.block_size == 0
+
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
@@ -99,23 +112,27 @@ class GPTQ:
             Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
 
-            for i in range(count):
-                w = W1[:, i]
-                d = Hinv1[i, i]
+            if isinstance(self.quantizer, DMXQuantizer):
+                print('lala')
+                Q1 = self.quantizer.quantize(W1)
+                Err1 = (W1 - Q1).matmul(torch.linalg.inv(Hinv1))
 
-                if groupsize != -1:
-                    if (i1 + i) % groupsize == 0:
-                        self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)], weight=True)
+            else:
+                for i in range(count):
+                    w = W1[:, i]
+                    d = Hinv1[i, i]
+                    if groupsize != -1:
+                        if (i1 + i) % groupsize == 0:
+                            self.quantizer.find_params(
+                                W[:, (i1 + i) : (i1 + i + groupsize)], weight=True
+                            )
+                    q = self.quantizer.quantize(w.unsqueeze(1)).flatten()
+                    Q1[:, i] = q
 
-                q = quantize(
-                    w.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
-                ).flatten()
-                Q1[:, i] = q
-                Losses1[:, i] = (w - q) ** 2 / d ** 2
-
-                err1 = (w - q) / d
-                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                Err1[:, i] = err1
+                    Losses1[:, i] = (w - q) ** 2 / d**2
+                    err1 = (w - q) / d
+                    W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                    Err1[:, i] = err1
 
             Q[:, i1:i2] = Q1
             Losses[:, i1:i2] = Losses1 / 2
@@ -129,12 +146,15 @@ class GPTQ:
                 print(torch.sum(Losses))
 
         torch.cuda.synchronize()
-        print('time %.2f' % (time.time() - tick))
-        print('error', torch.sum(Losses).item())
+        if DEBUG:
+            print("time %.2f" % (time.time() - tick))
+            print("error", torch.sum(Losses).item())
 
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
-        self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
+            self.layer.weight.data.dtype
+        )
         if DEBUG:
             print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
 
