@@ -1,60 +1,119 @@
-import time
-
 import torch
 import torch.nn as nn
+import argparse
+import os
 
-from .gptq import *
-from .modelutils import *
-from .quant import *
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", type=str, default=None, help="OPT model to load; pass `facebook/opt-X`.")
+parser.add_argument("--dataset", type=str, default="wikitext2", choices=["wikitext2", "ptb", "c4"])
+parser.add_argument("--seed", type=int, default=0, help="Seed for sampling the calibration data.")
+parser.add_argument("--nsamples", type=int, default=128, help="Number of calibration data samples.")
+parser.add_argument("--percdamp", type=float, default=0.01, help="Percent of the average Hessian diagonal to use for dampening.")
+parser.add_argument("--format", type=str, choices=["bfp", "sbfp", "int"], default="sbfp", help="Quantization format")
+parser.add_argument("--bfp_blocksize", type=int, default=128, help="BFP block size (128 for BFP12, 64 for BFP16)")
+parser.add_argument("--sbfp_blocksize", type=int, default=None, help="SBFP block size")
+parser.add_argument("--gptq_blocksize", type=int, default=128, help="GPTQ block size")
+parser.add_argument("--nearest", action="store_true", help="Whether to run the RTN baseline.")
+parser.add_argument( "--wbits", type=int, default=4, choices=[2, 3, 4, 5, 6, 8, 9, 16], help="#bits to use for quantization; use 16 for evaluating base model.")
+parser.add_argument("--sebias", type=int, default=7, choices=[7, 8, 9, 10, 11], help="for SBFP, uFP scaler's exponent bias")
+parser.add_argument( "--groupsize", type=int, default=-1, help="Groupsize to use for quantization; default uses full row.")
+parser.add_argument( "--save", type=str, default="", help="Save quantized checkpoint under this name.")
+parser.add_argument("--load", type=str, default="", help="Load quantized model.")
+parser.add_argument("--benchmark", type=int, default=0, help="Number of tokens to use for benchmarking.")
+parser.add_argument("--check", action="store_true", help="Whether to compute perplexity during benchmarking for verification.")
+parser.add_argument("--test", action="store_true", help="Test simple SBFP weight quantization (no splitting)")
+parser.add_argument("--qkv", action="store_true", default=False, help="use linear layers with SBFP kernel, only in the QKV linear layer")
+parser.add_argument("--mlp1", action="store_true", default=False, help="use linear layers with SBFP kernel, only in the first MLP layer")
+parser.add_argument("--mlp2", action="store_true", default=False, help="use linear layers with SBFP kernel, only in the second MLP layer")
+parser.add_argument("--all", action="store_true", default=False, help="use linear layers with SBFP kernel, in all linear layers")
+parser.add_argument("--fp32_calibration", action="store_true", default=False, help="compute GPTQ Hessians using FP32 weights/inputs")
+parser.add_argument("--gpu", type=str, default=None, help="GPU ID to use if specified")
+parser.add_argument("--multi_gpu", action="store_true", default=False, help="use model parallel")
+args = parser.parse_args()
+
+if args.gpu is not None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+
+from datautils import *
+from gptq import *
+from quant import *
 from functools import partial
 
+from mltools import dmx
+from mlreferences import (
+    squad_bigbird_large, 
+    squad_deberta_v3_large, 
+    squad_bert_large, 
+    squad_bert_base, 
+    
+    opt_125m, 
+    opt_350m, 
+    opt_1b3, 
+    opt_2b7, 
+    opt_6b7, 
+    opt_13b, 
+    opt_30b, 
+    opt_66b, 
+    
+    distilgpt2,
+    gpt2,  
+    gpt2_medium, 
+    gpt2_large, 
+    gpt2_xl, 
+    
+    bloom_560m, 
+    bloom_1b7, 
+    bloom_3b, 
+    bloom_7b1, 
+    
+    llama_7b, 
+    
+    squad_t5_small, 
+    squad_t5_base, 
+    squad_t5_large,
+    squad_t5_11b,
+    
+    lenet5,
+    lenet_512_512,
+    )
 
-def get_opt(model):
-    import torch
 
-    def skip(*args, **kwargs):
-        pass
+DEBUG = 1
+device = torch.device('cuda:0')
+LAYERS = [nn.Conv2d, nn.Linear]
+DMX_LAYERS = (dmx.nn.Linear, dmx.nn.HFTransformersConv1D)
 
-    torch.nn.init.kaiming_uniform_ = skip
-    torch.nn.init.uniform_ = skip
-    torch.nn.init.normal_ = skip
-    from transformers import OPTForCausalLM
 
-    model = OPTForCausalLM.from_pretrained(model, torch_dtype="auto")
-    model.seqlen = model.config.max_position_embeddings
-    return model
+def find_layers(module, layers=DMX_LAYERS, sbfp=False, name=''):
+    if type(module) in layers and module.layer_type is not None and 'SBFP' in module.layer_type or not sbfp:
+        return {name: module}
+    res = {}
+    for name1, child in module.named_children():
+        res.update(find_layers(child, layers=layers, sbfp=sbfp, name=name + '.' + name1 if name != '' else name1))
+    return res
 
 
 @torch.no_grad()
-def opt_sequential(
-    model,
-    dataloader,
-    dev,
-    quantizer_cls=INTQuantizer,
-    wbits=4,
-    percdamp=0.01,
-    groupsize=-1,
-):
-    print("Starting ...")
+def opt_sequential(model, dataloader, device, seqlen=None, quantizer=None, args=None):
+    print(f'\n\nCalibrating {args.model} on {args.nsamples} samples from {args.dataset} dataset')
+    
+    use_cache = model.body.config.use_cache
+    model.body.config.use_cache = False
+    layers = model.body.model.decoder.layers
 
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.decoder.layers
-
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
-    model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
-    if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
-    if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.to(dev)
-    layers[0] = layers[0].to(dev)
+    model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.to(device)
+    model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.to(device)
+    if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
+        model.body.model.decoder.project_out = model.body.model.decoder.project_out.to(device)
+    if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
+        model.body.model.decoder.project_in = model.body.model.decoder.project_in.to(device)
+        
+    layers[0] = layers[0].to(device)
 
     dtype = next(iter(model.parameters())).dtype  # why?
-    inps = torch.zeros(
-        (len(dataloader), model.seqlen, model.config.hidden_size),
-        dtype=dtype,
-        device=dev,
-    )
+    
+    # collect inputs to the first decoder block
+    inputs = torch.zeros((len(dataloader), seqlen, model.body.config.hidden_size), dtype=dtype, device=device)      # OPT-125m:  (128, 2048, 768)
     cache = {"i": 0, "attention_mask": None}
 
     class Catcher(nn.Module):
@@ -63,117 +122,111 @@ def opt_sequential(
             self.module = module
 
         def forward(self, inp, **kwargs):
-            inps[
-                cache["i"]
-            ] = inp  # cache["i"] is just an integer index to dataloader, this is a recording mechanism: why not use input hook?
+            inputs[cache["i"]] = inp  # cache["i"] is just an integer index to dataloader, this is a recording mechanism: why not use input hook?
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
             raise ValueError  # an ugly way of making the forward stop after layer[0]
 
     layers[0] = Catcher(layers[0])
+    
     for batch in dataloader:
         try:
-            model(batch[0].to(dev))
+            model(batch[0].to(device))
         except ValueError:
             pass  # an ugly way of making the forward stop after layer[0]
+        
+    # by now we should have decoder inputs from all data examples in the calibration set
+    
     layers[0] = layers[0].module
-
     layers[0] = layers[0].cpu()
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
-    model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
-    if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.cpu()
-    if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.cpu()
+    model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.cpu()
+    model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.cpu()
+    if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
+        model.body.model.decoder.project_out = model.body.model.decoder.project_out.cpu()
+    if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
+        model.body.model.decoder.project_in = model.body.model.decoder.project_in.cpu()
     torch.cuda.empty_cache()
 
-    outs = torch.zeros_like(inps)
-    attention_mask = cache["attention_mask"]
+    outs = torch.zeros_like(inputs)   # outs will become next decoder block inputs
+    
+    print(f'\n\nQuantizing {args.model} weights to {args.format} {args.wbits} bits using GPTQ algorithm\n\n')
 
-    # by now, one should have inps from all data examples for layer[0]
-
-    print("Ready.")
-
-    print("Quantizing...")
-
-    quantizers = {}
-    for i in range(len(layers)):  # going through decoder layers
-        layer = layers[i].to(dev)  # move layers to GPU one at a time
-
-        subset = find_layers(layer)
-        # subset is a dictionary holding 6 Linear modules in the layer
-        gptq = {}  # dictionary to hold gptq objects
+    for i in range(len(layers)):      # going through decoder layers
+        layer = layers[i].to(device)  # move layers to GPU one at a time
+        subset = find_layers(layer, sbfp=isinstance(quantizer, SBFPQuantizer))   # subset is a dictionary holding 6 Linear modules in the layer
+        
+        gptq = {}                     # dictionary to hold gptq objects
+        # gptq object holds each linear layer module, layer weights W, num_rows/cols, Hessian, and num_samples
         for name in subset:
-            gptq[name] = GPTQ(subset[name])  # GPTQ object with a layer
-            gptq[name].quantizer = quantizer_cls()
-            # attache a quantizer; why not pass in with GPTQ constructor?
-            gptq[name].quantizer.configure(
-                wbits, perchannel=True, sym=False, mse=False
-            )  # why not specify as args to Quantizer constructor?
+            gptq[name] = GPTQ(subset[name], quantizer=quantizer)      # GPTQ object with a layer
+            if args.test:
+                gptq[name].layer.test = True
+            if args.fp32_calibration:
+                gptq[name].layer.fp32_calibration = True
+            gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=False, mse=False)  # why not specify as args to Quantizer constructor?
 
-        ###
+        # compute Hessians for each layer (done in gptq.add_batch function)
         def add_batch(name):
             def tmp(_, inp, out):
                 gptq[name].add_batch(inp[0].data, out.data)
-
             return tmp
 
         handles = []
         for name in subset:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
+
         for j in range(len(dataloader)):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            # this outs list is not used (only to produce Hessians)
+            outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=cache["attention_mask"])[0]
+            
         for h in handles:
             h.remove()
-        ###
-
+            
+        # by now every linear layers in this layer (block) should have a Hessian attached
+            
+        print(f'Quantizing Block {i}')
         for name in subset:
+            # disable FP32 calibration mode if it was enabled
+            if args.fp32_calibration:
+                gptq[name].layer.fp32_calibration = False
             if DEBUG:
-                print(i, name)
-                print("Quantizing ...")
-            gptq[name].fasterquant(percdamp=percdamp, groupsize=groupsize)  # GPTQ algo
-            quantizers["model.decoder.layers.%d.%s" % (i, name)] = gptq[name].quantizer
+                print(f'\t{name}')
+            gptq[name].fasterquant(blocksize=args.gptq_blocksize, percdamp=args.percdamp, groupsize=args.groupsize)  # GPTQ algo
             gptq[name].free()
+            
+        # compute output to use as next layer input
         for j in range(len(dataloader)):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=cache["attention_mask"])[0]
 
         layers[i] = layer.cpu()
         del layer
         del gptq
         torch.cuda.empty_cache()
 
-        inps, outs = outs, inps  # what is going on here?
+        inputs, outs = outs, inputs  # pass this layer output as input to next layer
 
-    model.config.use_cache = use_cache
-
-    print("Done.")
-
-    return quantizers
+    model.body.config.use_cache = use_cache
 
 
 @torch.no_grad()
-def opt_eval(model, testenc, dev):
-    print("Evaluating ...")
-
+def opt_eval(model, testenc, device, seqlen=None, quantizer=None, args=None):
     testenc = testenc.input_ids
-    nsamples = testenc.numel() // model.seqlen
+    nsamples = testenc.numel() // seqlen
 
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.decoder.layers
+    use_cache = model.body.config.use_cache
+    model.body.config.use_cache = False
+    layers = model.body.model.decoder.layers
 
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
-    model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
-    if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
-    if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.to(dev)
-    layers[0] = layers[0].to(dev)
+    model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.to(device)
+    model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.to(device)
+    if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
+        model.body.model.decoder.project_out = model.body.model.decoder.project_out.to(device)
+    if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
+        model.body.model.decoder.project_in = model.body.model.decoder.project_in.to(device)
+    layers[0] = layers[0].to(device)
 
     dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
-    )
+    inputs = torch.zeros((nsamples, seqlen, model.body.config.hidden_size), dtype=dtype, device=device)
     cache = {"i": 0, "attention_mask": None}
 
     class Catcher(nn.Module):
@@ -182,357 +235,156 @@ def opt_eval(model, testenc, dev):
             self.module = module
 
         def forward(self, inp, **kwargs):
-            inps[cache["i"]] = inp
+            inputs[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
             raise ValueError
 
     layers[0] = Catcher(layers[0])
     for i in range(nsamples):
-        batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(dev)
+        batch = testenc[:, (i * seqlen) : ((i + 1) * seqlen)].to(device)
         try:
             model(batch)
         except ValueError:
             pass
+        
     layers[0] = layers[0].module
-
     layers[0] = layers[0].cpu()
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
-    model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
-    if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.cpu()
-    if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.cpu()
+    model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.cpu()
+    model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.cpu()
+    if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
+        model.body.model.decoder.project_out = model.body.model.decoder.project_out.cpu()
+    if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
+        model.body.model.decoder.project_in = model.body.model.decoder.project_in.cpu()
     torch.cuda.empty_cache()
 
-    outs = torch.zeros_like(inps)
+    outs = torch.zeros_like(inputs)
     attention_mask = cache["attention_mask"]
 
     for i in range(len(layers)):
-        # print(i)
-        layer = layers[i].to(dev)
+        layer = layers[i].to(device)
 
-        if args.nearest:
-            subset = find_layers(layer)
+        if args.nearest and args.wbits < 16:
+            print(f'\nQuantizing {args.model} block {i} weights to {args.format} {args.wbits} bits (RTN algorithm)')
+            subset = find_layers(layer, sbfp=isinstance(quantizer, SBFPQuantizer))
+            
             for name in subset:
-                quantizer = Quantizer()
+                print(f'\t{name}')
                 quantizer.configure(args.wbits, perchannel=True, sym=False, mse=False)
                 W = subset[name].weight.data
                 quantizer.find_params(W, weight=True)
-                subset[name].weight.data = quantizer.quantize(
-                    W  # , quantizer.scale, quantizer.zero, quantizer.maxq
-                ).to(next(iter(layer.parameters())).dtype)
+                subset[name].weight.data = quantizer.quantize(W).to(next(iter(layer.parameters())).dtype)    # can also pass: quantizer.scale, quantizer.zero, quantizer.maxq
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
-        inps, outs = outs, inps
+        inputs, outs = outs, inputs
 
-    if model.model.decoder.final_layer_norm is not None:
-        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(
-            dev
-        )
-    if model.model.decoder.project_out is not None:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
-    model.lm_head = model.lm_head.to(dev)
+    if model.body.model.decoder.final_layer_norm is not None:
+        model.body.model.decoder.final_layer_norm = model.body.model.decoder.final_layer_norm.to(device)
+    if model.body.model.decoder.project_out is not None:
+        model.body.model.decoder.project_out = model.body.model.decoder.project_out.to(device)
+    model.body.lm_head = model.body.lm_head.to(device)
 
-    testenc = testenc.to(dev)
+    testenc = testenc.to(device)
     nlls = []
     for i in range(nsamples):
-        hidden_states = inps[i].unsqueeze(0)
-        if model.model.decoder.final_layer_norm is not None:
-            hidden_states = model.model.decoder.final_layer_norm(hidden_states)
-        if model.model.decoder.project_out is not None:
-            hidden_states = model.model.decoder.project_out(hidden_states)
-        lm_logits = model.lm_head(hidden_states)
+        hidden_states = inputs[i].unsqueeze(0)
+        if model.body.model.decoder.final_layer_norm is not None:
+            hidden_states = model.body.model.decoder.final_layer_norm(hidden_states)
+        if model.body.model.decoder.project_out is not None:
+            hidden_states = model.body.model.decoder.project_out(hidden_states)
+        lm_logits = model.body.lm_head(hidden_states)
         shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)][:, 1:]
+        shift_labels = testenc[:, (i * seqlen) : ((i + 1) * seqlen)][:, 1:]
         loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-        )
-        neg_log_likelihood = loss.float() * model.seqlen
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        neg_log_likelihood = loss.float() * seqlen
         nlls.append(neg_log_likelihood)
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
-    print(f"ppl = {ppl.item()}")
-
-    model.config.use_cache = use_cache
-
-
-# TODO: perform packing on GPU
-def opt_pack3(model, quantizers):
-    layers = find_layers(model)
-    layers = {n: layers[n] for n in quantizers}
-    make_quant3(model, quantizers)
-    qlayers = find_layers(model, [Quant3Linear])
-    print("Packing ...")
-    for name in qlayers:
-        print(name)
-        quantizers[name] = quantizers[name].cpu()
-        qlayers[name].pack(layers[name], quantizers[name].scale, quantizers[name].zero)
-    print("Done.")
-    return model
-
-
-def load_quant3(model, checkpoint):
-    from transformers import OPTConfig, OPTForCausalLM
-
-    config = OPTConfig.from_pretrained(model)
-
-    def noop(*args, **kwargs):
-        pass
-
-    torch.nn.init.kaiming_uniform_ = noop
-    torch.nn.init.uniform_ = noop
-    torch.nn.init.normal_ = noop
-
-    torch.set_default_dtype(torch.half)
-    transformers.modeling_utils._init_weights = False
-    torch.set_default_dtype(torch.half)
-    model = OPTForCausalLM(config)
-    torch.set_default_dtype(torch.float)
-    model = model.eval()
-    layers = find_layers(model)
-    for name in ["model.decoder.project_out", "model.decoder.project_in", "lm_head"]:
-        if name in layers:
-            del layers[name]
-    make_quant3(model, layers)
-
-    print("Loading model ...")
-    model.load_state_dict(torch.load(checkpoint))
-    model.seqlen = model.config.max_position_embeddings
-    print("Done.")
-
-    return model
-
-
-def opt_multigpu(model, gpus):
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(gpus[0])
-    model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(
-        gpus[0]
-    )
-    if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.to(gpus[0])
-    if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(gpus[-1])
-    if (
-        hasattr(model.model.decoder, "final_layer_norm")
-        and model.model.decoder.final_layer_norm
-    ):
-        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(
-            gpus[-1]
-        )
-    import copy
-
-    model.lm_head = copy.deepcopy(model.lm_head).to(gpus[-1])
-
-    cache = {"mask": None}
-
-    class MoveModule(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-            self.dev = next(iter(self.module.parameters())).device
-
-        def forward(self, *inp, **kwargs):
-            inp = list(inp)
-            if inp[0].device != self.dev:
-                inp[0] = inp[0].to(self.dev)
-            if cache["mask"] is None or cache["mask"].device != self.dev:
-                cache["mask"] = kwargs["attention_mask"].to(self.dev)
-            kwargs["attention_mask"] = cache["mask"]
-            tmp = self.module(*inp, **kwargs)
-            return tmp
-
-    layers = model.model.decoder.layers
-    pergpu = math.ceil(len(layers) / len(gpus))
-    for i in range(len(layers)):
-        layers[i] = MoveModule(layers[i].to(gpus[i // pergpu]))
-
-    model.gpus = gpus
-
-
-def benchmark(model, input_ids, check=False):
-    input_ids = input_ids.to(model.gpus[0] if hasattr(model, "gpus") else DEV)
-    torch.cuda.synchronize()
-
-    cache = {"past": None}
-
-    def clear_past(i):
-        def tmp(layer, inp, out):
-            if cache["past"]:
-                cache["past"][i] = None
-
-        return tmp
-
-    for i, layer in enumerate(model.model.decoder.layers):
-        layer.register_forward_hook(clear_past(i))
-
-    print("Benchmarking ...")
-
-    if check:
-        loss = nn.CrossEntropyLoss()
-        tot = 0.0
-
-    def sync():
-        if hasattr(model, "gpus"):
-            for gpu in model.gpus:
-                torch.cuda.synchronize(gpu)
-        else:
-            torch.cuda.synchronize()
-
-    with torch.no_grad():
-        attention_mask = torch.ones((1, input_ids.numel()), device=DEV)
-        times = []
-        for i in range(input_ids.numel()):
-            tick = time.time()
-            out = model(
-                input_ids[:, i].reshape(-1),
-                past_key_values=cache["past"],
-                attention_mask=attention_mask[:, : (i + 1)].reshape((1, -1)),
-            )
-            sync()
-            times.append(time.time() - tick)
-            print(i, times[-1])
-            if check and i != input_ids.numel() - 1:
-                tot += loss(
-                    out.logits[0].to(DEV), input_ids[:, (i + 1)].to(DEV)
-                ).float()
-            cache["past"] = list(out.past_key_values)
-            del out
-        sync()
-        import numpy as np
-
-        print("Median:", np.median(times))
-        if check:
-            print("PPL:", torch.exp(tot / (input_ids.numel() - 1)).item())
+        
+    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * seqlen))
+    model.body.config.use_cache = use_cache
+    return ppl.item()
 
 
 if __name__ == "__main__":
-    import argparse
-    from datautils import *
+    dmx.aware(patch_hf_transformers=True)
 
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "model", type=str, help="OPT model to load; pass `facebook/opt-X`."
-    )
-    parser.add_argument(
-        "dataset",
-        type=str,
-        choices=["wikitext2", "ptb", "c4"],
-        help="Where to extract calibration data from.",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=0, help="Seed for sampling the calibration data."
-    )
-    parser.add_argument(
-        "--nsamples", type=int, default=128, help="Number of calibration data samples."
-    )
-    parser.add_argument(
-        "--percdamp",
-        type=float,
-        default=0.01,
-        help="Percent of the average Hessian diagonal to use for dampening.",
-    )
-    parser.add_argument(
-        "--format",
-        type=str,
-        choices=["bfp", "sbfp", "int"],
-        default="int",
-        help="Quantization format",
-    )
-    parser.add_argument(
-        "--nearest", action="store_true", help="Whether to run the RTN baseline."
-    )
-    parser.add_argument(
-        "--wbits",
-        type=int,
-        default=16,
-        choices=[2, 3, 4, 8, 16],
-        help="#bits to use for quantization; use 16 for evaluating base model.",
-    )
-    parser.add_argument(
-        "--sebias",
-        type=int,
-        default=7,
-        choices=[7, 8, 9, 10, 11],
-        help="for SBFP, uFP scaler's exponent bias",
-    )
-    parser.add_argument(
-        "--groupsize",
-        type=int,
-        default=-1,
-        help="Groupsize to use for quantization; default uses full row.",
-    )
-    parser.add_argument(
-        "--save",
-        type=str,
-        default="",
-        help="Save quantized checkpoint under this name.",
-    )
-    parser.add_argument("--load", type=str, default="", help="Load quantized model.")
-    parser.add_argument(
-        "--benchmark",
-        type=int,
-        default=0,
-        help="Number of tokens to use for benchmarking.",
-    )
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="Whether to compute perplexity during benchmarking for verification.",
-    )
-
-    args = parser.parse_args()
-
-    if args.format == "int":
-        Quantizer = INTQuantizer
-    elif args.format == "bfp":
-        Quantizer = partial(DMXQuantizer, fmt=args.format)
-    elif args.format == "sbfp":
-        Quantizer = partial(DMXQuantizer, fmt=args.format, sebias=args.sebias)
-
-    if args.load:
-        model = load_quant3(args.model, args.load)
+    results = {}
+    exp_str = ''
+    
+    if args.model is not None:
+        models = [args.model]
     else:
-        model = get_opt(args.model)
-        model.eval()
+        models = ['opt_125m', 'opt_350m', 'opt_1b3', 'opt_2b7']
+    
+    if args.sbfp_blocksize is None:
+        sbfp_blocksizes = [256, 512, 1024]
+    else:
+        sbfp_blocksizes = [args.sbfp_blocksize]
+    
+    for model in models:
+        args.model = model
+        model_results = {}
+        
+        for sbfp_blocksize in sbfp_blocksizes:
+            
+            if args.format == "int":
+                Quantizer = INTQuantizer
+            elif args.format == "bfp":
+                Quantizer = partial(DMXQuantizer, fmt=args.format, block_size=args.bfp_blocksize)
+            elif args.format == "sbfp":
+                Quantizer = partial(SBFPQuantizer, fmt=args.format, num_bits=args.wbits, block_size=sbfp_blocksize, sebias=args.sebias, test=args.test)
 
-    dataloader, testloader = get_loaders(
-        args.dataset,
-        nsamples=args.nsamples,
-        seed=args.seed,
-        model=args.model,
-        seqlen=model.seqlen,
-    )
+            wl = eval(model)()
+            
+            if args.mlp1:
+                config = eval(f'wl.dmx_configs.BASELINE_SBFP_{sbfp_blocksize}_MLP1')
+                exp_str = 'mlp1'
+            elif args.mlp2:
+                config = eval(f'wl.dmx_configs.BASELINE_SBFP_{sbfp_blocksize}_MLP2')
+                exp_str = 'mlp2'
+            elif args.qkv:
+                config = eval(f'wl.dmx_configs.BASELINE_SBFP_{sbfp_blocksize}_QKV')
+                exp_str = 'qkv'
+            elif args.all: 
+                config = eval(f'wl.dmx_configs.BASELINE_SBFP_{sbfp_blocksize}')
+                exp_str = 'all'
+            else:
+                config = eval(f'wl.dmx_configs.BASELINE')
+                exp_str = 'no'
+                
+            print(f'\n\nTransforming model to {config}')            
+            wl.model.transform(config)
+            if args.multi_gpu:
+                wl.model.body.parallelize()
 
-    if args.wbits < 16 and not args.nearest:
-        tick = time.time()
-        quantizers = opt_sequential(model, dataloader, DEV)
-        print(time.time() - tick)
+            if args.wbits < 16 and not args.nearest:
+                print(f'\n\nGetting {args.nsamples} samples from {args.dataset} dataset for calibration')
+                dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, model='facebook/opt-125m', seqlen=wl.max_seq_len)
+                quantizers = opt_sequential(wl.model, dataloader, device, seqlen=wl.max_seq_len, quantizer=Quantizer(), args=args)
 
-    if args.benchmark:
-        gpus = [torch.device("cuda:%d" % i) for i in range(torch.cuda.device_count())]
-        if len(gpus) > 1:
-            opt_multigpu(model, gpus)
-        else:
-            model = model.to(DEV)
-        if args.benchmark:
-            input_ids = next(iter(dataloader))[0][:, : args.benchmark]
-            benchmark(model, input_ids, check=args.check)
-    if args.load:
-        exit()
-
-    for dataset in ["ptb"]:  # ["wikitext2", "ptb", "c4"]:
-        dataloader, testloader = get_loaders(
-            dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
-        )
-        print(dataset)
-        opt_eval(model, testloader, DEV)
-
-    if args.save:
-        opt_pack3(model, quantizers)
-        torch.save(model.state_dict(), args.save)
+            print(f'\n\nGetting full {args.dataset} dataloader')
+            dataloader, testloader = get_loaders(args.dataset, seed=args.seed, model='facebook/opt-125m', seqlen=wl.max_seq_len)
+            
+            print(f'\n\nEvaluating {model} on {args.dataset} dataset')
+            ppl = opt_eval(wl.model, testloader, device, seqlen=wl.max_seq_len, quantizer=Quantizer(), args=args) 
+            print(f"\n\nPerpexity: {ppl:.2f}\n\n") 
+            
+            model_results[sbfp_blocksize] = ppl
+            print(f'\n\nModel {model}: quantizing {exp_str} layers using GPTQ and SBFP\n')
+            print(model_results, '\n\n')
+            for bs, ppl in model_results.items():
+                print(f'\nModel {model}: perplexity for SBFP blocksize {bs:>4}:  {ppl:5.2f}') 
+            print('\n\n')
+    
+        results[model] = model_results
+        print(results, '\n\n')
+        for mod, res in results.items():
+            print(f'\nModel {mod}')
+            for bs, ppl in res.items():
+                print(f'\tPerplexity for SBFP blocksize {bs:>4}:  {ppl:5.2f}')
+    print('\n\n\n')

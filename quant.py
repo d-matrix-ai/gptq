@@ -1,13 +1,19 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from mltools import corsair, numerical
+import torch.nn.functional as F
+from mltools import dmx, numerical
 
 
 def _quantize(x, scale, zero, maxq):
     q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
     return scale * (q - zero)
 
+try:
+    import quant_cuda
+except:
+    print('CUDA extension not installed.')
+    
 
 class INTQuantizer(nn.Module):
     def __init__(self, shape=1):
@@ -17,16 +23,7 @@ class INTQuantizer(nn.Module):
         self.register_buffer("zero", torch.zeros(shape))
         self.block_size = 1
 
-    def configure(
-        self,
-        bits,
-        perchannel=False,
-        sym=True,
-        mse=False,
-        norm=2.4,
-        grid=100,
-        maxshrink=0.8,
-    ):
+    def configure(self, bits, perchannel=False, sym=True, mse=False, norm=2.4, grid=100, maxshrink=0.8):
         self.maxq = torch.tensor(2**bits - 1)
         self.perchannel = perchannel
         self.sym = sym
@@ -124,43 +121,111 @@ class INTQuantizer(nn.Module):
 
     def ready(self):
         return torch.all(self.scale != 0)
+    
+    
+class SBFPQuantizer(nn.Module):
+    def __init__(self, fmt="sbfp", num_bits=4, block_size=128, sebias=7, test=False):
+        super().__init__()
+        self.fmt = fmt
+        self.block_size = block_size
+        self.num_bits = num_bits
+        self.test = test
+        self.sebias = sebias
+        self.transpose = False
+        
+    def quantize_blocks_sbfp(self, blocks, block_dim=-1, num_bits=4, dequantize=True):
+        # find maximum for every block
+        max_vals = blocks.abs().amax(block_dim, keepdim=True)
 
+        # compute scaling factors for INT4 range mapping
+        scaling_factors = max_vals / (2 ** (num_bits - 1) - 1)    # 7 for INT4
+        # if the entire block is zeroes, keep them as zeroes (to avoid division by zero).
+        scaling_factors[max_vals == 0] = 1
+        
+        # map original to INT4 range
+        blocks_q = blocks / scaling_factors
+        # quantize by rounding, then clip to remove any values > 7
+        blocks_q = blocks_q.round_()#.clamp_(min=-8, max=7)  # clamping is unnecessary after rounding
+
+        if dequantize:
+            # map the quantized values to the original range
+            blocks_dq = blocks_q * scaling_factors
+            return blocks_dq
+        else:
+            return blocks_q, scaling_factors
+            
+    def quantize_weights_sbfp(self, W, layer=None):
+        self.num_rows, self.num_cols = W.shape
+        assert self.num_cols % self.block_size == 0   # we should be receiving already padded weights (in GPTQ init function)
+        num_blocks = int(self.num_cols / self.block_size)
+        split_weights = W.reshape(self.num_rows, num_blocks, self.block_size)   # [768, 2304] --> [768, 72, 32]
+        
+        layer.block_size = self.block_size  # <-- this is coming from model dmx config file
+        layer.dtype = W.dtype
+        layer.use_loop = 1
+        layer.bfp_block_size = 128
+        layer.num_bits = self.num_bits
+        layer.bfp_num_bits = 8   # 8 bits for BFP16, 4 bits for BFP12
+        layer.num_blocks = num_blocks
+        layer.test = self.test
+
+        if self.test:
+            # GPTQ block: 128, SBFP block: 64    
+            # process (128, 48, 64) chunk out of (768, 48, 64)
+            weights_sbfp = self.quantize_blocks_sbfp(split_weights, block_dim=-1, num_bits=self.num_bits, dequantize=True)
+            return weights_sbfp.reshape(self.num_rows, self.num_cols)
+
+        else:
+            split_weights_int4, scaling_factors = self.quantize_blocks_sbfp(split_weights, block_dim=-1, num_bits=self.num_bits, dequantize=False)
+            layer.already_quantized = True
+            return split_weights_int4, scaling_factors
+            split_weights_int4 = split_weights_int4.to(W.dtype)
+            split_weights_int4 = split_weights_int4.transpose(0, 1)   # [768, 72, 32] --> [72, 768, 32]
+            scaling_factors = scaling_factors.permute(1, 2, 0).unsqueeze(0).to(W.dtype)   # [768, 72, 1] --> [1, 72, 768] --> [72, 1, 768] --> [1, 72, 1, 768]
+            layer.split_weight_shape = split_weights_int4.shape
+            return split_weights_int4, scaling_factors
+
+    def configure(self, bits, perchannel=True, sym=False, mse=False):
+        pass
+        
+    def find_params(self, *args, **kwargs):
+        # all dummy values below, not used
+        self.maxq = None
+        self.scale = None
+        self.zero = None
+
+    def quantize(self, W, layer=None):
+        #breakpoint()
+        return self.quantize_weights_sbfp(W, layer=layer)
+
+    def enabled(self):
+        return True
+
+    def ready(self):
+        return True
 
 class DMXQuantizer(nn.Module):
-    def __init__(
-        self, shape=1, fmt="bfp", block_size=128, sebias=7, *args, **kwargs
-    ) -> None:
+    def __init__(self, fmt="bfp", block_size=128, sebias=7):
         super().__init__()
         self.fmt = fmt
         self.block_size = block_size
         self.sebias = sebias
 
-    def configure(self, bits, *args, **kwargs):
+    def configure(self, bits, perchannel=True, sym=False, mse=False):
         if self.fmt == "bfp":
-            self.format = numerical.BlockFloatingPoint(
-                precision=bits,
-                block_size=self.block_size,
-                block_dim=-1,
-            )
+            self.format = numerical.BlockFloatingPoint(precision=bits, block_size=self.block_size, block_dim=-1)
         elif self.fmt == "sbfp" and bits == 4:
             self.format = numerical.ScaledBlockFloatingPoint(
                 block_format=numerical.Format.from_shorthand("XP[4,0](CSN)"),
-                scaler_format=numerical.FloatingPoint(
-                    mantissa=4,
-                    exponent=4,
-                    bias=self.sebias,
-                    flush_subnormal=True,
-                    unsigned=True,
-                    rounding="nearest",
-                ),
-                block_size=16,
+                scaler_format=numerical.FloatingPoint(mantissa=4, exponent=4, bias=self.sebias, flush_subnormal=True, unsigned=True, rounding="nearest"),
+                block_size=self.block_size,
                 block_dim=-1,
             )
         else:
             raise ValueError(
                 f"unsupported precision {bits} for d-Matrix numerical format {self.fmt}"
             )
-        self.cast_to = corsair.CastTo(format=self.format)
+        self.cast_to = dmx.CastTo(format=self.format)
 
     def find_params(self, *args, **kwargs):
         # all dummy values below, not used
