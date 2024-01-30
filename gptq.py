@@ -109,9 +109,7 @@ class GPTQ:
                 Q1 = self.quantizer.quantize(W1)
                 Err1 = (W1 - Q1).matmul(torch.linalg.inv(Hinv1))
             elif isinstance(self.quantizer, SBFPQuantizer):
-                if isinstance(self.layer, nn.Linear):
-                    self.quantizer.transpose = True
-
+                # At this point, the layer weights are unquantized (GPTQ init captured them before nn.py quantized them)
                 # pad W to multiple of SBFP blocksize
                 last_block_size = int(self.layer.orig_num_cols % self.quantizer.block_size)
                 W1_padded = W1.T

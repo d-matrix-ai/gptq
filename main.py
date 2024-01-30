@@ -1,10 +1,9 @@
-import torch
-import torch.nn as nn
 import argparse
+import math
 import os
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--model", type=str, default=None, help="OPT model to load; pass `facebook/opt-X`.")
+parser.add_argument("--model", type=str, default=None, help="OPT or BLOOM model name (opt_125m, bloom_560m, etc)")
 parser.add_argument("--dataset", type=str, default="wikitext2", choices=["wikitext2", "ptb", "c4"])
 parser.add_argument("--seed", type=int, default=0, help="Seed for sampling the calibration data.")
 parser.add_argument("--nsamples", type=int, default=128, help="Number of calibration data samples.")
@@ -17,9 +16,6 @@ parser.add_argument("--nearest", action="store_true", help="Whether to run the R
 parser.add_argument( "--wbits", type=int, default=4, choices=[2, 3, 4, 5, 6, 8, 9, 16], help="#bits to use for quantization; use 16 for evaluating base model.")
 parser.add_argument("--sebias", type=int, default=7, choices=[7, 8, 9, 10, 11], help="for SBFP, uFP scaler's exponent bias")
 parser.add_argument( "--groupsize", type=int, default=-1, help="Groupsize to use for quantization; default uses full row.")
-parser.add_argument( "--save", type=str, default="", help="Save quantized checkpoint under this name.")
-parser.add_argument("--load", type=str, default="", help="Load quantized model.")
-parser.add_argument("--benchmark", type=int, default=0, help="Number of tokens to use for benchmarking.")
 parser.add_argument("--check", action="store_true", help="Whether to compute perplexity during benchmarking for verification.")
 parser.add_argument("--test", action="store_true", help="Test simple SBFP weight quantization (no splitting)")
 parser.add_argument("--qkv", action="store_true", default=False, help="use linear layers with SBFP kernel, only in the QKV linear layer")
@@ -28,11 +24,13 @@ parser.add_argument("--mlp2", action="store_true", default=False, help="use line
 parser.add_argument("--all", action="store_true", default=False, help="use linear layers with SBFP kernel, in all linear layers")
 parser.add_argument("--fp32_calibration", action="store_true", default=False, help="compute GPTQ Hessians using FP32 weights/inputs")
 parser.add_argument("--gpu", type=str, default=None, help="GPU ID to use if specified")
-parser.add_argument("--multi_gpu", action="store_true", default=False, help="use model parallel")
 args = parser.parse_args()
 
 if args.gpu is not None:
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    
+import torch
+import torch.nn as nn
 
 from datautils import *
 from gptq import *
@@ -82,8 +80,8 @@ DEBUG = 1
 device = torch.device('cuda:0')
 LAYERS = [nn.Conv2d, nn.Linear]
 DMX_LAYERS = (dmx.nn.Linear, dmx.nn.HFTransformersConv1D)
-
-
+    
+    
 def find_layers(module, layers=DMX_LAYERS, sbfp=False, name=''):
     if type(module) in layers and module.layer_type is not None and 'SBFP' in module.layer_type or not sbfp:
         return {name: module}
@@ -99,14 +97,26 @@ def opt_sequential(model, dataloader, device, seqlen=None, quantizer=None, args=
     
     use_cache = model.body.config.use_cache
     model.body.config.use_cache = False
-    layers = model.body.model.decoder.layers
-
-    model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.to(device)
-    model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.to(device)
-    if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
-        model.body.model.decoder.project_out = model.body.model.decoder.project_out.to(device)
-    if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
-        model.body.model.decoder.project_in = model.body.model.decoder.project_in.to(device)
+    
+    if 'opt' in args.model:
+        layers = model.body.model.decoder.layers
+        
+        model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.to(device)
+        model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.to(device)
+        if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
+            model.body.model.decoder.project_out = model.body.model.decoder.project_out.to(device)
+        if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
+            model.body.model.decoder.project_in = model.body.model.decoder.project_in.to(device)
+            
+        cache = {"i": 0, "attention_mask": None}
+        
+    elif 'bloom' in args.model:
+        layers = model.body.transformer.h
+        
+        model.body.transformer.word_embeddings = model.body.transformer.word_embeddings.to(device)
+        model.body.transformer.word_embeddings_layernorm = (model.body.transformer.word_embeddings_layernorm.to(device))
+        
+        cache = {"i": 0, "attention_mask": None, "alibi": None}
         
     layers[0] = layers[0].to(device)
 
@@ -114,7 +124,7 @@ def opt_sequential(model, dataloader, device, seqlen=None, quantizer=None, args=
     
     # collect inputs to the first decoder block
     inputs = torch.zeros((len(dataloader), seqlen, model.body.config.hidden_size), dtype=dtype, device=device)      # OPT-125m:  (128, 2048, 768)
-    cache = {"i": 0, "attention_mask": None}
+    
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -125,6 +135,8 @@ def opt_sequential(model, dataloader, device, seqlen=None, quantizer=None, args=
             inputs[cache["i"]] = inp  # cache["i"] is just an integer index to dataloader, this is a recording mechanism: why not use input hook?
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
+            if 'bloom' in args.model:
+                cache["alibi"] = kwargs["alibi"]
             raise ValueError  # an ugly way of making the forward stop after layer[0]
 
     layers[0] = Catcher(layers[0])
@@ -139,17 +151,25 @@ def opt_sequential(model, dataloader, device, seqlen=None, quantizer=None, args=
     
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.cpu()
-    model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.cpu()
-    if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
-        model.body.model.decoder.project_out = model.body.model.decoder.project_out.cpu()
-    if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
-        model.body.model.decoder.project_in = model.body.model.decoder.project_in.cpu()
+    
+    if 'opt' in args.model:
+        model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.cpu()
+        model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.cpu()
+        if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
+            model.body.model.decoder.project_out = model.body.model.decoder.project_out.cpu()
+        if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
+            model.body.model.decoder.project_in = model.body.model.decoder.project_in.cpu()
+        
+    elif 'bloom' in args.model:
+        model.body.transformer.word_embeddings = model.body.transformer.word_embeddings.cpu()
+        model.body.transformer.word_embeddings_layernorm = (model.body.transformer.word_embeddings_layernorm.cpu())
+        
+        
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inputs)   # outs will become next decoder block inputs
-    
-    print(f'\n\nQuantizing {args.model} weights to {args.format} {args.wbits} bits using GPTQ algorithm\n\n')
+    blocksize_str = f'_{args.sbfp_blocksize}' if 'sbfp' in args.format else ''
+    print(f'\n\nQuantizing {args.model} weights to {args.format}{blocksize_str} {args.wbits} bits using GPTQ algorithm\n\n')
 
     for i in range(len(layers)):      # going through decoder layers
         layer = layers[i].to(device)  # move layers to GPU one at a time
@@ -177,26 +197,36 @@ def opt_sequential(model, dataloader, device, seqlen=None, quantizer=None, args=
 
         for j in range(len(dataloader)):
             # this outs list is not used (only to produce Hessians)
-            outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=cache["attention_mask"])[0]
+            if 'opt' in args.model:
+                outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=cache["attention_mask"])[0]
+            elif 'bloom' in args.model:
+                outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=cache["attention_mask"], alibi=cache['alibi'])[0]
             
         for h in handles:
             h.remove()
             
         # by now every linear layers in this layer (block) should have a Hessian attached
             
-        print(f'Quantizing Block {i}')
+        fp32_cal_str = ' (FP32 calibration)' if args.fp32_calibration else ''
+        print(f'Quantizing Block {i}{fp32_cal_str}')
         for name in subset:
             # disable FP32 calibration mode if it was enabled
             if args.fp32_calibration:
                 gptq[name].layer.fp32_calibration = False
-            if DEBUG:
-                print(f'\t{name}')
+                print(f'\t{name} weights: {list(gptq[name].layer.weight.shape)} -->', end=" ")
+            else:
+                print(f'\t{name} ', end=' ')
             gptq[name].fasterquant(blocksize=args.gptq_blocksize, percdamp=args.percdamp, groupsize=args.groupsize)  # GPTQ algo
+            if args.fp32_calibration:
+                print(f'{list(gptq[name].layer.weight.shape)}')
             gptq[name].free()
             
         # compute output to use as next layer input
         for j in range(len(dataloader)):
-            outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=cache["attention_mask"])[0]
+            if 'opt' in args.model:
+                outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=cache["attention_mask"])[0]
+            elif 'bloom' in args.model:
+                outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=cache["attention_mask"], alibi=cache['alibi'])[0]
 
         layers[i] = layer.cpu()
         del layer
@@ -215,19 +245,31 @@ def opt_eval(model, testenc, device, seqlen=None, quantizer=None, args=None):
 
     use_cache = model.body.config.use_cache
     model.body.config.use_cache = False
-    layers = model.body.model.decoder.layers
-
-    model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.to(device)
-    model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.to(device)
-    if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
-        model.body.model.decoder.project_out = model.body.model.decoder.project_out.to(device)
-    if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
-        model.body.model.decoder.project_in = model.body.model.decoder.project_in.to(device)
+    
+    if 'opt' in args.model:
+        layers = model.body.model.decoder.layers
+        
+        model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.to(device)
+        model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.to(device)
+        if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
+            model.body.model.decoder.project_out = model.body.model.decoder.project_out.to(device)
+        if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
+            model.body.model.decoder.project_in = model.body.model.decoder.project_in.to(device)
+            
+        cache = {"i": 0, "attention_mask": None}
+        
+    elif 'bloom' in args.model:
+        layers = model.body.transformer.h
+        
+        model.body.transformer.word_embeddings = model.body.transformer.word_embeddings.to(device)
+        model.body.transformer.word_embeddings_layernorm = (model.body.transformer.word_embeddings_layernorm.to(device))
+        
+        cache = {"i": 0, "attention_mask": None, "alibi": None}
+    
     layers[0] = layers[0].to(device)
 
     dtype = next(iter(model.parameters())).dtype
     inputs = torch.zeros((nsamples, seqlen, model.body.config.hidden_size), dtype=dtype, device=device)
-    cache = {"i": 0, "attention_mask": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -238,6 +280,8 @@ def opt_eval(model, testenc, device, seqlen=None, quantizer=None, args=None):
             inputs[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
+            if 'bloom' in args.model:
+                cache["alibi"] = kwargs["alibi"]
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -250,16 +294,21 @@ def opt_eval(model, testenc, device, seqlen=None, quantizer=None, args=None):
         
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.cpu()
-    model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.cpu()
-    if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
-        model.body.model.decoder.project_out = model.body.model.decoder.project_out.cpu()
-    if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
-        model.body.model.decoder.project_in = model.body.model.decoder.project_in.cpu()
+    
+    if 'opt' in args.model:
+        model.body.model.decoder.embed_tokens = model.body.model.decoder.embed_tokens.cpu()
+        model.body.model.decoder.embed_positions = model.body.model.decoder.embed_positions.cpu()
+        if hasattr(model.body.model.decoder, "project_out") and model.body.model.decoder.project_out:
+            model.body.model.decoder.project_out = model.body.model.decoder.project_out.cpu()
+        if hasattr(model.body.model.decoder, "project_in") and model.body.model.decoder.project_in:
+            model.body.model.decoder.project_in = model.body.model.decoder.project_in.cpu()
+    elif 'bloom' in args.model:
+        model.body.transformer.word_embeddings = model.body.transformer.word_embeddings.cpu()
+        model.body.transformer.word_embeddings_layernorm = (model.body.transformer.word_embeddings_layernorm.cpu())
+        
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inputs)
-    attention_mask = cache["attention_mask"]
 
     for i in range(len(layers)):
         layer = layers[i].to(device)
@@ -276,27 +325,39 @@ def opt_eval(model, testenc, device, seqlen=None, quantizer=None, args=None):
                 subset[name].weight.data = quantizer.quantize(W).to(next(iter(layer.parameters())).dtype)    # can also pass: quantizer.scale, quantizer.zero, quantizer.maxq
 
         for j in range(nsamples):
-            outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            if 'opt' in args.model:
+                outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=cache["attention_mask"])[0]
+            elif 'bloom' in args.model:
+                outs[j] = layer(inputs[j].unsqueeze(0), attention_mask=cache["attention_mask"], alibi=cache['alibi'])[0]
             
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
         inputs, outs = outs, inputs
 
-    if model.body.model.decoder.final_layer_norm is not None:
-        model.body.model.decoder.final_layer_norm = model.body.model.decoder.final_layer_norm.to(device)
-    if model.body.model.decoder.project_out is not None:
-        model.body.model.decoder.project_out = model.body.model.decoder.project_out.to(device)
+    if 'opt' in args.model:
+        if model.body.model.decoder.final_layer_norm is not None:
+            model.body.model.decoder.final_layer_norm = model.body.model.decoder.final_layer_norm.to(device)
+        if model.body.model.decoder.project_out is not None:
+            model.body.model.decoder.project_out = model.body.model.decoder.project_out.to(device)
+    elif 'bloom' in args.model:
+        model.body.transformer.ln_f = model.body.transformer.ln_f.to(device)
+        
     model.body.lm_head = model.body.lm_head.to(device)
 
     testenc = testenc.to(device)
     nlls = []
     for i in range(nsamples):
         hidden_states = inputs[i].unsqueeze(0)
-        if model.body.model.decoder.final_layer_norm is not None:
-            hidden_states = model.body.model.decoder.final_layer_norm(hidden_states)
-        if model.body.model.decoder.project_out is not None:
-            hidden_states = model.body.model.decoder.project_out(hidden_states)
+        
+        if 'opt' in args.model:
+            if model.body.model.decoder.final_layer_norm is not None:
+                hidden_states = model.body.model.decoder.final_layer_norm(hidden_states)
+            if model.body.model.decoder.project_out is not None:
+                hidden_states = model.body.model.decoder.project_out(hidden_states)
+        elif 'bloom' in args.model:
+            hidden_states = model.body.transformer.ln_f(hidden_states)
+            
         lm_logits = model.body.lm_head(hidden_states)
         shift_logits = lm_logits[:, :-1, :].contiguous()
         shift_labels = testenc[:, (i * seqlen) : ((i + 1) * seqlen)][:, 1:]
@@ -320,6 +381,7 @@ if __name__ == "__main__":
         models = [args.model]
     else:
         models = ['opt_125m', 'opt_350m', 'opt_1b3', 'opt_2b7']
+        models = ['bloom_560m', 'bloom_1b7']
     
     if args.sbfp_blocksize is None:
         sbfp_blocksizes = [256, 512, 1024]
@@ -359,17 +421,20 @@ if __name__ == "__main__":
                 
             print(f'\n\nTransforming model to {config}')            
             wl.model.transform(config)
-            if args.multi_gpu:
-                wl.model.body.parallelize()
 
+            if 'opt' in args.model:
+                tokenizer_model = 'facebook/opt-125m'
+            elif 'bloom' in args.model:
+                tokenizer_model = 'bigscience/bloom-560m'
+                    
             if args.wbits < 16 and not args.nearest:
                 print(f'\n\nGetting {args.nsamples} samples from {args.dataset} dataset for calibration')
-                dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, model='facebook/opt-125m', seqlen=wl.max_seq_len)
+                dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, model=tokenizer_model, seqlen=wl.max_seq_len)
                 quantizers = opt_sequential(wl.model, dataloader, device, seqlen=wl.max_seq_len, quantizer=Quantizer(), args=args)
 
             print(f'\n\nGetting full {args.dataset} dataloader')
-            dataloader, testloader = get_loaders(args.dataset, seed=args.seed, model='facebook/opt-125m', seqlen=wl.max_seq_len)
-            
+            dataloader, testloader = get_loaders(args.dataset, seed=args.seed, model=tokenizer_model, seqlen=wl.max_seq_len)
+                
             print(f'\n\nEvaluating {model} on {args.dataset} dataset')
             ppl = opt_eval(wl.model, testloader, device, seqlen=wl.max_seq_len, quantizer=Quantizer(), args=args) 
             print(f"\n\nPerpexity: {ppl:.2f}\n\n") 

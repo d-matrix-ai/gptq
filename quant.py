@@ -22,6 +22,7 @@ class INTQuantizer(nn.Module):
         self.register_buffer("scale", torch.zeros(shape))
         self.register_buffer("zero", torch.zeros(shape))
         self.block_size = 1
+        self.test = False
 
     def configure(self, bits, perchannel=False, sym=True, mse=False, norm=2.4, grid=100, maxshrink=0.8):
         self.maxq = torch.tensor(2**bits - 1)
@@ -131,7 +132,6 @@ class SBFPQuantizer(nn.Module):
         self.num_bits = num_bits
         self.test = test
         self.sebias = sebias
-        self.transpose = False
         
     def quantize_blocks_sbfp(self, blocks, block_dim=-1, num_bits=4, dequantize=True):
         # find maximum for every block
@@ -210,6 +210,7 @@ class DMXQuantizer(nn.Module):
         self.fmt = fmt
         self.block_size = block_size
         self.sebias = sebias
+        self.test = False
 
     def configure(self, bits, perchannel=True, sym=False, mse=False):
         if self.fmt == "bfp":
