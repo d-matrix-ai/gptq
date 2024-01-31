@@ -70,7 +70,7 @@ class GPTQ:
             assert blocksize % self.quantizer.block_size == 0
 
         W = self.W.float()
-
+        
         if not self.quantizer.ready():
             self.quantizer.find_params(W, weight=True)
 
@@ -80,9 +80,6 @@ class GPTQ:
         H[dead, dead] = 1
         W[:, dead] = 0
 
-        Losses = torch.zeros_like(W)
-        Q = torch.zeros_like(W)
-
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
@@ -91,10 +88,23 @@ class GPTQ:
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
         
-        if not self.quantizer.test:
+        if isinstance(self.quantizer, SBFPQuantizer) and not self.quantizer.test:
             scaling_factors_list = []
             split_weights_list = []
-
+            
+        # At this point, the layer weights are still unquantized (GPTQ init captured them before nn.py quantized them)
+        
+        if isinstance(self.quantizer, SBFPQuantizer):
+            # pad W to multiple of SBFP blocksize
+            last_block_size = int(self.layer.orig_num_cols % self.quantizer.block_size)
+            if last_block_size != 0:
+                last_block_pad = self.quantizer.block_size - last_block_size
+                W = F.pad(W.T, (0, last_block_pad), 'constant', 0).T
+                print(f'\n\t\tPadding weights to {list(W.shape)}\n')
+                
+        Losses = torch.zeros_like(W)
+        Q = torch.zeros_like(W)
+                    
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -109,24 +119,14 @@ class GPTQ:
                 Q1 = self.quantizer.quantize(W1)
                 Err1 = (W1 - Q1).matmul(torch.linalg.inv(Hinv1))
             elif isinstance(self.quantizer, SBFPQuantizer):
-                # At this point, the layer weights are unquantized (GPTQ init captured them before nn.py quantized them)
-                # pad W to multiple of SBFP blocksize
-                last_block_size = int(self.layer.orig_num_cols % self.quantizer.block_size)
-                W1_padded = W1.T
-                if last_block_size != 0:
-                    last_block_pad = self.quantizer.block_size - last_block_size
-                    W1_padded = F.pad(W1.T, (0, last_block_pad), 'constant', 0)
-                        
                 if self.quantizer.test:
-                    Q1_padded = self.quantizer.quantize(W1_padded, layer=self.layer).T  #(3072, 128)
+                    Q1 = self.quantizer.quantize(W1.T, layer=self.layer).T  #(3072, 128)
                 else:            
-                    split_weights_int4, scaling_factors = self.quantizer.quantize(W1_padded, layer=self.layer)  # [128, 48, 64], [128, 48, 1]
+                    split_weights_int4, scaling_factors = self.quantizer.quantize(W1.T, layer=self.layer)  # [128, 12, 256], [128, 12, 1]
                     scaling_factors_list.append(scaling_factors)
                     split_weights_list.append(split_weights_int4)
-                    Q1_padded = (split_weights_int4 * scaling_factors).view(blocksize, -1).T    # [128, 48, 64] --> [3072, 128]
-                    
-                # remove padding to compute error and update Hessians  
-                Q1 = Q1_padded[:self.layer.orig_num_cols, :]
+                    Q1 = (split_weights_int4 * scaling_factors).view(blocksize, -1).T    # [128, 12, 256] --> [3072, 128]
+                     
                 Err1 = (W1 - Q1).matmul(torch.linalg.inv(Hinv1))
             else:
                 for i in range(count):
@@ -165,7 +165,8 @@ class GPTQ:
         
         if isinstance(self.quantizer, SBFPQuantizer):
             if self.quantizer.test:
-                self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+                # remove padding if any before updating layer weights
+                self.layer.weight.data = Q[:self.layer.orig_num_cols, :].reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
             else:
                 split_weights_int4 = torch.cat(split_weights_list)
                 scaling_factors = torch.cat(scaling_factors_list)

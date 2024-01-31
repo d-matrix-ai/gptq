@@ -83,16 +83,16 @@ DMX_LAYERS = (dmx.nn.Linear, dmx.nn.HFTransformersConv1D)
     
     
 def find_layers(module, layers=DMX_LAYERS, sbfp=False, name=''):
-    if type(module) in layers and module.layer_type is not None and 'SBFP' in module.layer_type or not sbfp:
+    if (type(module) in layers) and ((module.layer_type is not None and 'SBFP' in module.layer_type) or not sbfp):
         return {name: module}
     res = {}
     for name1, child in module.named_children():
-        res.update(find_layers(child, layers=layers, sbfp=sbfp, name=name + '.' + name1 if name != '' else name1))
+        res.update(find_layers(child, sbfp=sbfp, name=name + '.' + name1 if name != '' else name1))
     return res
 
 
 @torch.no_grad()
-def opt_sequential(model, dataloader, device, seqlen=None, quantizer=None, args=None):
+def opt_sequential(model, dataloader, device, seqlen=None, quantizer_cls=None, exp_str=None, args=None):
     print(f'\n\nCalibrating {args.model} on {args.nsamples} samples from {args.dataset} dataset')
     
     use_cache = model.body.config.use_cache
@@ -168,18 +168,22 @@ def opt_sequential(model, dataloader, device, seqlen=None, quantizer=None, args=
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inputs)   # outs will become next decoder block inputs
-    blocksize_str = f'_{args.sbfp_blocksize}' if 'sbfp' in args.format else ''
-    print(f'\n\nQuantizing {args.model} weights to {args.format}{blocksize_str} {args.wbits} bits using GPTQ algorithm\n\n')
+    quant_str = f'INT{args.wbits}' if args.format == 'int' else f'{args.format}_{quantizer_cls().block_size}_{args.wbits}bit'
+    print(f'\n\nQuantizing {args.model} weights to {quant_str} using GPTQ algorithm\n\n')
 
     for i in range(len(layers)):      # going through decoder layers
         layer = layers[i].to(device)  # move layers to GPU one at a time
-        subset = find_layers(layer, sbfp=isinstance(quantizer, SBFPQuantizer))   # subset is a dictionary holding 6 Linear modules in the layer
+        subset = find_layers(layer, sbfp=args.format == 'sbfp')   # subset is a dictionary holding 6 Linear modules in the layer
+        if len(subset) == 0:
+            print(f'No layers selected for quantization in block {i}')
+            continue
         
         gptq = {}                     # dictionary to hold gptq objects
         # gptq object holds each linear layer module, layer weights W, num_rows/cols, Hessian, and num_samples
         for name in subset:
+            quantizer = quantizer_cls()
             gptq[name] = GPTQ(subset[name], quantizer=quantizer)      # GPTQ object with a layer
-            if args.test:
+            if args.test and isinstance(quantizer, SBFPQuantizer):
                 gptq[name].layer.test = True
             if args.fp32_calibration:
                 gptq[name].layer.fp32_calibration = True
@@ -208,18 +212,33 @@ def opt_sequential(model, dataloader, device, seqlen=None, quantizer=None, args=
         # by now every linear layers in this layer (block) should have a Hessian attached
             
         fp32_cal_str = ' (FP32 calibration)' if args.fp32_calibration else ''
-        print(f'Quantizing Block {i}{fp32_cal_str}')
+        print(f'\nQuantizing {exp_str} layers in decoder block {i}{fp32_cal_str}')
         for name in subset:
             # disable FP32 calibration mode if it was enabled
             if args.fp32_calibration:
                 gptq[name].layer.fp32_calibration = False
-                print(f'\t{name} weights: {list(gptq[name].layer.weight.shape)} -->', end=" ")
-            else:
-                print(f'\t{name} ', end=' ')
+                
+            weights_before = gptq[name].W.detach().cpu().numpy()
+            print(f'\n\t{name} weights before quantization: {list(gptq[name].W.shape)}\n')
+            
             gptq[name].fasterquant(blocksize=args.gptq_blocksize, percdamp=args.percdamp, groupsize=args.groupsize)  # GPTQ algo
-            if args.fp32_calibration:
-                print(f'{list(gptq[name].layer.weight.shape)}')
+            
+            if not args.test and isinstance(quantizer, SBFPQuantizer):
+                weights_after = gptq[name].layer.weight.detach().cpu().numpy().astype(np.float16)
+                scaling_factors =  gptq[name].layer.scaling_factors[0].permute(0, 2, 1).cpu().numpy().astype(np.float16)
+                dequant_weights = weights_after * scaling_factors
+                quant_values_str = f'{weights_before[:6, 0]}\n\t{weights_after[0, 0, :6]}\n\t{dequant_weights[0, 0, :6]}'
+                dequant_weights_orig_shape = dequant_weights.transpose(1, 0, 2).reshape(weights_before.shape[1], -1).T[:weights_before.shape[0], :]
+            else:
+                dequant_weights = gptq[name].layer.weight.detach().cpu().numpy().astype(np.float16)
+                quant_values_str = f'{weights_before[:6, 0]}\n\t{dequant_weights[:6, 0]}'
+                dequant_weights_orig_shape = dequant_weights
+            
+            quant_error = 100 * (weights_before - dequant_weights_orig_shape).__abs__().sum() / weights_before.__abs__().sum()
+            print(f'\n\t{name} weights after quantization: {list(gptq[name].layer.weight.shape)}\n\n\t{quant_values_str}\n\n\tquant error {quant_error:.2f}%\n')
             gptq[name].free()
+            
+        print('\n')
             
         # compute output to use as next layer input
         for j in range(len(dataloader)):
@@ -239,7 +258,7 @@ def opt_sequential(model, dataloader, device, seqlen=None, quantizer=None, args=
 
 
 @torch.no_grad()
-def opt_eval(model, testenc, device, seqlen=None, quantizer=None, args=None):
+def opt_eval(model, testenc, device, seqlen=None, quantizer_cls=None, args=None):
     testenc = testenc.input_ids
     nsamples = testenc.numel() // seqlen
 
@@ -315,10 +334,11 @@ def opt_eval(model, testenc, device, seqlen=None, quantizer=None, args=None):
 
         if args.nearest and args.wbits < 16:
             print(f'\nQuantizing {args.model} block {i} weights to {args.format} {args.wbits} bits (RTN algorithm)')
-            subset = find_layers(layer, sbfp=isinstance(quantizer, SBFPQuantizer))
+            subset = find_layers(layer, sbfp=args.format == 'sbfp')
             
             for name in subset:
                 print(f'\t{name}')
+                quantizer = quantizer_cls()
                 quantizer.configure(args.wbits, perchannel=True, sym=False, mse=False)
                 W = subset[name].weight.data
                 quantizer.find_params(W, weight=True)
@@ -383,40 +403,48 @@ if __name__ == "__main__":
         models = ['opt_125m', 'opt_350m', 'opt_1b3', 'opt_2b7']
         models = ['bloom_560m', 'bloom_1b7']
     
-    if args.sbfp_blocksize is None:
-        sbfp_blocksizes = [256, 512, 1024]
+    if args.format == 'sbfp':
+        if args.sbfp_blocksize is None:
+            blocksizes = [256, 512, 1024]
+        else:
+            blocksizes = [args.sbfp_blocksize]
     else:
-        sbfp_blocksizes = [args.sbfp_blocksize]
+        blocksizes = [args.bfp_blocksize]
     
     for model in models:
         args.model = model
         model_results = {}
         
-        for sbfp_blocksize in sbfp_blocksizes:
+        for blocksize in blocksizes:
             
             if args.format == "int":
                 Quantizer = INTQuantizer
             elif args.format == "bfp":
                 Quantizer = partial(DMXQuantizer, fmt=args.format, block_size=args.bfp_blocksize)
             elif args.format == "sbfp":
-                Quantizer = partial(SBFPQuantizer, fmt=args.format, num_bits=args.wbits, block_size=sbfp_blocksize, sebias=args.sebias, test=args.test)
+                Quantizer = partial(SBFPQuantizer, fmt=args.format, num_bits=args.wbits, block_size=blocksize, sebias=args.sebias, test=args.test)
 
             wl = eval(model)()
             
+            config = eval(f'wl.dmx_configs.BASELINE')
+            
             if args.mlp1:
-                config = eval(f'wl.dmx_configs.BASELINE_SBFP_{sbfp_blocksize}_MLP1')
+                if args.format == 'sbfp':
+                    config = eval(f'wl.dmx_configs.BASELINE_SBFP_{blocksize}_MLP1')
                 exp_str = 'mlp1'
             elif args.mlp2:
-                config = eval(f'wl.dmx_configs.BASELINE_SBFP_{sbfp_blocksize}_MLP2')
+                if args.format == 'sbfp':
+                    config = eval(f'wl.dmx_configs.BASELINE_SBFP_{blocksize}_MLP2')
                 exp_str = 'mlp2'
             elif args.qkv:
-                config = eval(f'wl.dmx_configs.BASELINE_SBFP_{sbfp_blocksize}_QKV')
+                if args.format == 'sbfp':
+                    config = eval(f'wl.dmx_configs.BASELINE_SBFP_{blocksize}_QKV')
                 exp_str = 'qkv'
-            elif args.all: 
-                config = eval(f'wl.dmx_configs.BASELINE_SBFP_{sbfp_blocksize}')
+            elif args.all:
+                if args.format == 'sbfp':
+                    config = eval(f'wl.dmx_configs.BASELINE_SBFP_{blocksize}')
                 exp_str = 'all'
             else:
-                config = eval(f'wl.dmx_configs.BASELINE')
                 exp_str = 'no'
                 
             print(f'\n\nTransforming model to {config}')            
@@ -430,20 +458,20 @@ if __name__ == "__main__":
             if args.wbits < 16 and not args.nearest:
                 print(f'\n\nGetting {args.nsamples} samples from {args.dataset} dataset for calibration')
                 dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, model=tokenizer_model, seqlen=wl.max_seq_len)
-                quantizers = opt_sequential(wl.model, dataloader, device, seqlen=wl.max_seq_len, quantizer=Quantizer(), args=args)
+                quantizers = opt_sequential(wl.model, dataloader, device, seqlen=wl.max_seq_len, quantizer_cls=Quantizer, exp_str=exp_str, args=args)
 
             print(f'\n\nGetting full {args.dataset} dataloader')
             dataloader, testloader = get_loaders(args.dataset, seed=args.seed, model=tokenizer_model, seqlen=wl.max_seq_len)
                 
             print(f'\n\nEvaluating {model} on {args.dataset} dataset')
-            ppl = opt_eval(wl.model, testloader, device, seqlen=wl.max_seq_len, quantizer=Quantizer(), args=args) 
+            ppl = opt_eval(wl.model, testloader, device, seqlen=wl.max_seq_len, quantizer_cls=Quantizer, args=args) 
             print(f"\n\nPerpexity: {ppl:.2f}\n\n") 
             
-            model_results[sbfp_blocksize] = ppl
-            print(f'\n\nModel {model}: quantizing {exp_str} layers using GPTQ and SBFP\n')
+            model_results[blocksize] = ppl
+            print(f'\n\nModel {model}: quantizing {exp_str} layers using GPTQ and {args.format}\n')
             print(model_results, '\n\n')
             for bs, ppl in model_results.items():
-                print(f'\nModel {model}: perplexity for SBFP blocksize {bs:>4}:  {ppl:5.2f}') 
+                print(f'\nModel {model}: perplexity for {args.format} blocksize {bs:>4}:  {ppl:5.2f}') 
             print('\n\n')
     
         results[model] = model_results
@@ -451,5 +479,5 @@ if __name__ == "__main__":
         for mod, res in results.items():
             print(f'\nModel {mod}')
             for bs, ppl in res.items():
-                print(f'\tPerplexity for SBFP blocksize {bs:>4}:  {ppl:5.2f}')
+                print(f'\tPerplexity for {args.format} blocksize {bs:>4}:  {ppl:5.2f}')
     print('\n\n\n')

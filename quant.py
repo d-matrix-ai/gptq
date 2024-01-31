@@ -22,7 +22,6 @@ class INTQuantizer(nn.Module):
         self.register_buffer("scale", torch.zeros(shape))
         self.register_buffer("zero", torch.zeros(shape))
         self.block_size = 1
-        self.test = False
 
     def configure(self, bits, perchannel=False, sym=True, mse=False, norm=2.4, grid=100, maxshrink=0.8):
         self.maxq = torch.tensor(2**bits - 1)
@@ -32,6 +31,7 @@ class INTQuantizer(nn.Module):
         self.norm = norm
         self.grid = grid
         self.maxshrink = maxshrink
+        self.num_bits = bits
 
     def find_params(self, x, weight=False):
         dev = x.device
@@ -114,6 +114,7 @@ class INTQuantizer(nn.Module):
 
     def quantize(self, x):
         if self.ready():
+            #print(f'\t\tQuantizing GPTQ block {list(x.shape)} to INT{self.num_bits}')
             return _quantize(x, self.scale, self.zero, self.maxq)
         return x
 
@@ -134,6 +135,7 @@ class SBFPQuantizer(nn.Module):
         self.sebias = sebias
         
     def quantize_blocks_sbfp(self, blocks, block_dim=-1, num_bits=4, dequantize=True):
+        print(f'\t\t\tQuantizing SBFP blocks {list(blocks.shape)}')
         # find maximum for every block
         max_vals = blocks.abs().amax(block_dim, keepdim=True)
 
@@ -195,7 +197,7 @@ class SBFPQuantizer(nn.Module):
         self.zero = None
 
     def quantize(self, W, layer=None):
-        #breakpoint()
+        print(f'\t\tQuantizing GPTQ block {list(W.shape)} to SBFP_{self.block_size}_{self.num_bits}b')
         return self.quantize_weights_sbfp(W, layer=layer)
 
     def enabled(self):
@@ -210,7 +212,6 @@ class DMXQuantizer(nn.Module):
         self.fmt = fmt
         self.block_size = block_size
         self.sebias = sebias
-        self.test = False
 
     def configure(self, bits, perchannel=True, sym=False, mse=False):
         if self.fmt == "bfp":
@@ -227,6 +228,7 @@ class DMXQuantizer(nn.Module):
                 f"unsupported precision {bits} for d-Matrix numerical format {self.fmt}"
             )
         self.cast_to = dmx.CastTo(format=self.format)
+        self.num_bits = bits
 
     def find_params(self, *args, **kwargs):
         # all dummy values below, not used
@@ -240,6 +242,7 @@ class DMXQuantizer(nn.Module):
             #     # NOTE: ugly fix due to GPTQ's unsqueeze() before quantize() call
             #     return self.cast_to(x.squeeze(-1).float()).unsqueeze(-1)
             # else:
+            print(f'\t\tQuantizing GPTQ block {list(x.shape)} to BFP_{self.block_size}_{self.num_bits}b')
             return self.cast_to(x.float())
         return x
 
