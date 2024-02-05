@@ -66,7 +66,7 @@ class GPTQ:
             
     def fasterquant(self, blocksize=128, percdamp=0.01, groupsize=-1):
         # TODO: make sure weight dim is correct for quantizer
-        if isinstance(self.quantizer, DMXQuantizer):
+        if isinstance(self.quantizer, DMXQuantizer) or (isinstance(self.quantizer, SBFPQuantizer) and self.quantizer.original):
             assert blocksize % self.quantizer.block_size == 0
 
         W = self.W.float()
@@ -88,13 +88,13 @@ class GPTQ:
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
         
-        if isinstance(self.quantizer, SBFPQuantizer) and not self.quantizer.test:
+        if isinstance(self.quantizer, SBFPQuantizer) and not self.quantizer.test and not self.quantizer.original:
             scaling_factors_list = []
             split_weights_list = []
             
         # At this point, the layer weights are still unquantized (GPTQ init captured them before nn.py quantized them)
         
-        if isinstance(self.quantizer, SBFPQuantizer):
+        if isinstance(self.quantizer, SBFPQuantizer) and not self.quantizer.original:
             # pad W to multiple of SBFP blocksize
             last_block_size = int(self.layer.orig_num_cols % self.quantizer.block_size)
             if last_block_size != 0:
@@ -114,12 +114,13 @@ class GPTQ:
             Err1 = torch.zeros_like(W1)
             Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
-
             if isinstance(self.quantizer, DMXQuantizer):
                 Q1 = self.quantizer.quantize(W1)
                 Err1 = (W1 - Q1).matmul(torch.linalg.inv(Hinv1))
             elif isinstance(self.quantizer, SBFPQuantizer):
                 if self.quantizer.test:
+                    Q1 = self.quantizer.quantize(W1.T, layer=self.layer).T  #(3072, 128)
+                elif self.quantizer.original:
                     Q1 = self.quantizer.quantize(W1.T, layer=self.layer).T  #(3072, 128)
                 else:            
                     split_weights_int4, scaling_factors = self.quantizer.quantize(W1.T, layer=self.layer)  # [128, 12, 256], [128, 12, 1]
@@ -164,7 +165,7 @@ class GPTQ:
             
         
         if isinstance(self.quantizer, SBFPQuantizer):
-            if self.quantizer.test:
+            if self.quantizer.test or self.quantizer.original:
                 # remove padding if any before updating layer weights
                 self.layer.weight.data = Q[:self.layer.orig_num_cols, :].reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
             else:

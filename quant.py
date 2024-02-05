@@ -126,12 +126,14 @@ class INTQuantizer(nn.Module):
     
     
 class SBFPQuantizer(nn.Module):
-    def __init__(self, fmt="sbfp", num_bits=4, block_size=128, sebias=7, test=False):
+    def __init__(self, fmt="sbfp", num_bits=4, block_size=128, sebias=7, test=False, original=False, fp8=False):
         super().__init__()
         self.fmt = fmt
         self.block_size = block_size
         self.num_bits = num_bits
         self.test = test
+        self.original = original
+        self.fp8 = fp8
         self.sebias = sebias
         
     def quantize_blocks_sbfp(self, blocks, block_dim=-1, num_bits=4, dequantize=True):
@@ -141,6 +143,9 @@ class SBFPQuantizer(nn.Module):
 
         # compute scaling factors for INT4 range mapping
         scaling_factors = max_vals / (2 ** (num_bits - 1) - 1)    # 7 for INT4
+        if self.fp8:
+            # quantize scaling_factors to FP8 unsigned (equiv to FP9 signed)
+            scaling_factors = numerical.CastTo(format="FP[1|5|3,15](FN)")(scaling_factors)
         # if the entire block is zeroes, keep them as zeroes (to avoid division by zero).
         scaling_factors[max_vals == 0] = 1
         
@@ -158,9 +163,15 @@ class SBFPQuantizer(nn.Module):
             
     def quantize_weights_sbfp(self, W, layer=None):
         self.num_rows, self.num_cols = W.shape
-        assert self.num_cols % self.block_size == 0   # we should be receiving already padded weights (in GPTQ init function)
-        num_blocks = int(self.num_cols / self.block_size)
-        split_weights = W.reshape(self.num_rows, num_blocks, self.block_size)   # [768, 2304] --> [768, 72, 32]
+    
+        if self.original:
+            assert self.num_rows % self.block_size == 0   # # GPTQ block will contain one or more SBFP blocks
+            num_blocks = int(self.num_rows / self.block_size)
+            split_weights = W.reshape(num_blocks, self.block_size, self.num_cols)   # [768, 2304] --> [N, 16, 2304]
+        else:
+            assert self.num_cols % self.block_size == 0   # we should be receiving already padded weights (in GPTQ init function)
+            num_blocks = int(self.num_cols / self.block_size)
+            split_weights = W.reshape(self.num_rows, num_blocks, self.block_size)   # [768, 2304] --> [768, 72, 32]
         
         layer.block_size = self.block_size  # <-- this is coming from model dmx config file
         layer.dtype = W.dtype
@@ -170,13 +181,23 @@ class SBFPQuantizer(nn.Module):
         layer.bfp_num_bits = 8   # 8 bits for BFP16, 4 bits for BFP12
         layer.num_blocks = num_blocks
         layer.test = self.test
+        layer.original = self.original
 
         if self.test:
             # GPTQ block: 128, SBFP block: 64    
             # process (128, 48, 64) chunk out of (768, 48, 64)
             weights_sbfp = self.quantize_blocks_sbfp(split_weights, block_dim=-1, num_bits=self.num_bits, dequantize=True)
             return weights_sbfp.reshape(self.num_rows, self.num_cols)
-
+        elif self.original:
+            # Full W is (768, 3072), and we want to quantize along 768 dim (along accumulation dim). 
+            # both gptq blocks and SBFP blocks are along the same 768 dim.
+            # we split W into gptq blocks: (6, 128, 3072) - here we assume we receive (128, 3072) blocks from GPTQ algo
+            # quantize each (128, 3072) chunk into SBFP:
+            # We take (128, 3072) and split it into SBFP blocks (block_size=16):
+            # (128, 3072) --> (8, 16, 3072)
+            # each of (16, 3072) blocks will have its own scaling factor
+            weights_sbfp = self.quantize_blocks_sbfp(split_weights, block_dim=1, num_bits=self.num_bits, dequantize=True)
+            return weights_sbfp.reshape(self.num_rows, self.num_cols)
         else:
             split_weights_int4, scaling_factors = self.quantize_blocks_sbfp(split_weights, block_dim=-1, num_bits=self.num_bits, dequantize=False)
             layer.already_quantized = True

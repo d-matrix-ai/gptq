@@ -17,13 +17,16 @@ parser.add_argument( "--wbits", type=int, default=4, choices=[2, 3, 4, 5, 6, 8, 
 parser.add_argument("--sebias", type=int, default=7, choices=[7, 8, 9, 10, 11], help="for SBFP, uFP scaler's exponent bias")
 parser.add_argument( "--groupsize", type=int, default=-1, help="Groupsize to use for quantization; default uses full row.")
 parser.add_argument("--check", action="store_true", help="Whether to compute perplexity during benchmarking for verification.")
-parser.add_argument("--test", action="store_true", help="Test simple SBFP weight quantization (no splitting)")
+parser.add_argument("--test", action="store_true", help="No split matmul SBFP weight quantization: SBFP blocks orthogonal to GPTQ blocks")
+parser.add_argument("--original", action="store_true", help="No split matmul SBFP weight quantization: SBFP blocks along GPTQ blocks")
 parser.add_argument("--qkv", action="store_true", default=False, help="use linear layers with SBFP kernel, only in the QKV linear layer")
 parser.add_argument("--mlp1", action="store_true", default=False, help="use linear layers with SBFP kernel, only in the first MLP layer")
 parser.add_argument("--mlp2", action="store_true", default=False, help="use linear layers with SBFP kernel, only in the second MLP layer")
 parser.add_argument("--all", action="store_true", default=False, help="use linear layers with SBFP kernel, in all linear layers")
 parser.add_argument("--fp32_calibration", action="store_true", default=False, help="compute GPTQ Hessians using FP32 weights/inputs")
 parser.add_argument("--gpu", type=str, default=None, help="GPU ID to use if specified")
+parser.add_argument("--fp8", action="store_true", help="SBFP: quantize scaling factors to FP8")
+parser.add_argument("--debug", action="store_true", help="print debug statements")
 args = parser.parse_args()
 
 if args.gpu is not None:
@@ -183,8 +186,11 @@ def opt_sequential(model, dataloader, device, seqlen=None, quantizer_cls=None, e
         for name in subset:
             quantizer = quantizer_cls()
             gptq[name] = GPTQ(subset[name], quantizer=quantizer)      # GPTQ object with a layer
-            if args.test and isinstance(quantizer, SBFPQuantizer):
-                gptq[name].layer.test = True
+            if isinstance(quantizer, SBFPQuantizer):
+                if args.test:
+                    gptq[name].layer.test = True
+                elif args.original:
+                    gptq[name].layer.original = True
             if args.fp32_calibration:
                 gptq[name].layer.fp32_calibration = True
             gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=False, mse=False)  # why not specify as args to Quantizer constructor?
@@ -218,19 +224,19 @@ def opt_sequential(model, dataloader, device, seqlen=None, quantizer_cls=None, e
             if args.fp32_calibration:
                 gptq[name].layer.fp32_calibration = False
                 
-            weights_before = gptq[name].W.detach().cpu().numpy()
+            weights_before = gptq[name].W.float().detach().cpu().numpy()
             print(f'\n\t{name} weights before quantization: {list(gptq[name].W.shape)}\n')
             
             gptq[name].fasterquant(blocksize=args.gptq_blocksize, percdamp=args.percdamp, groupsize=args.groupsize)  # GPTQ algo
             
-            if not args.test and isinstance(quantizer, SBFPQuantizer):
-                weights_after = gptq[name].layer.weight.detach().cpu().numpy().astype(np.float16)
-                scaling_factors =  gptq[name].layer.scaling_factors[0].permute(0, 2, 1).cpu().numpy().astype(np.float16)
+            if not args.test and not args.original and isinstance(quantizer, SBFPQuantizer):
+                weights_after = gptq[name].layer.weight.detach().float().cpu().numpy()
+                scaling_factors =  gptq[name].layer.scaling_factors[0].float().permute(0, 2, 1).cpu().numpy()
                 dequant_weights = weights_after * scaling_factors
                 quant_values_str = f'{weights_before[:6, 0]}\n\t{weights_after[0, 0, :6]}\n\t{dequant_weights[0, 0, :6]}'
                 dequant_weights_orig_shape = dequant_weights.transpose(1, 0, 2).reshape(weights_before.shape[1], -1).T[:weights_before.shape[0], :]
             else:
-                dequant_weights = gptq[name].layer.weight.detach().cpu().numpy().astype(np.float16)
+                dequant_weights = gptq[name].layer.weight.detach().float().cpu().numpy()
                 quant_values_str = f'{weights_before[:6, 0]}\n\t{dequant_weights[:6, 0]}'
                 dequant_weights_orig_shape = dequant_weights
             
@@ -400,8 +406,8 @@ if __name__ == "__main__":
     if args.model is not None:
         models = [args.model]
     else:
-        models = ['opt_125m', 'opt_350m', 'opt_1b3', 'opt_2b7']
-        models = ['bloom_560m', 'bloom_1b7']
+        models = ['opt_125m', 'opt_350m', 'opt_1b3']#, 'opt_2b7']
+        #models = ['bloom_560m', 'bloom_1b7']
     
     if args.format == 'sbfp':
         if args.sbfp_blocksize is None:
@@ -422,7 +428,7 @@ if __name__ == "__main__":
             elif args.format == "bfp":
                 Quantizer = partial(DMXQuantizer, fmt=args.format, block_size=args.bfp_blocksize)
             elif args.format == "sbfp":
-                Quantizer = partial(SBFPQuantizer, fmt=args.format, num_bits=args.wbits, block_size=blocksize, sebias=args.sebias, test=args.test)
+                Quantizer = partial(SBFPQuantizer, fmt=args.format, num_bits=args.wbits, block_size=blocksize, sebias=args.sebias, test=args.test, original=args.original, fp8=args.fp8)
 
             wl = eval(model)()
             
